@@ -1,5 +1,5 @@
 # Copyright 2009-2017 Wander Lairson Costa
-# Copyright 2009-2020 PyUSB contributors
+# Copyright 2009-2021 PyUSB contributors
 #
 # Redistribution and use in source and binary forms, with or without
 # modification, are permitted provided that the following conditions are
@@ -203,6 +203,12 @@ class _libusb_interface_descriptor(Structure):
                 ('endpoint', POINTER(_libusb_endpoint_descriptor)),
                 ('extra', POINTER(c_ubyte)),
                 ('extra_length', c_int)]
+
+
+class _libusb_timeval(Structure):
+    _fields_ = [('tv_sec', c_long),
+                ('tv_usec', c_long)]
+
 
 class _libusb_interface(Structure):
     _fields_ = [('altsetting', POINTER(_libusb_interface_descriptor)),
@@ -639,6 +645,11 @@ def _setup_prototypes(lib):
     #int libusb_handle_events(libusb_context *ctx);
     lib.libusb_handle_events.argtypes = [c_void_p]
 
+    #int libusb_handle_events_timeout_completed (libusb_context* ctx,
+	#                                            struct timeval* tv,
+    #                                            int* completed );
+    lib.libusb_handle_events_timeout_completed.argtypes = [c_void_p, POINTER(_libusb_timeval), POINTER(c_int)]
+
 # check a libusb function call
 def _check(ret):
     if hasattr(ret, 'value'):
@@ -658,8 +669,11 @@ def _check(ret):
 class _Device(_objfinalizer.AutoFinalizedObject):
     def __init__(self, devid):
         self.devid = _lib.libusb_ref_device(devid)
+
+    @methodtrace(_logger)
     def _finalize_object(self):
-        _lib.libusb_unref_device(self.devid)
+        if hasattr(self, 'devid'):
+            _lib.libusb_unref_device(self.devid)
 
 # wrap a descriptor and keep a reference to another object
 # Thanks to Thomas Reitmayr.
@@ -675,10 +689,10 @@ class _ConfigDescriptor(_objfinalizer.AutoFinalizedObject):
     def __init__(self, desc):
         self.desc = desc
     def _finalize_object(self):
-        _lib.libusb_free_config_descriptor(self.desc)
+        if hasattr(self, 'desc'):
+            _lib.libusb_free_config_descriptor(self.desc)
     def __getattr__(self, name):
         return getattr(self.desc.contents, name)
-
 
 # iterator for libusb devices
 class _DevIterator(_objfinalizer.AutoFinalizedObject):
@@ -692,7 +706,8 @@ class _DevIterator(_objfinalizer.AutoFinalizedObject):
         for i in range(self.num_devs):
             yield _Device(self.dev_list[i])
     def _finalize_object(self):
-        _lib.libusb_free_device_list(self.dev_list, 1)
+        if hasattr(self, 'dev_list'):
+            _lib.libusb_free_device_list(self.dev_list, 1)
 
 class _DeviceHandle(object):
     def __init__(self, dev):
@@ -701,12 +716,13 @@ class _DeviceHandle(object):
         _check(_lib.libusb_open(self.devid, byref(self.handle)))
 
 
-class _AsyncTransfer():
+class _AsyncTransfer:
     """ Generic API for asynchronous USB transfers"""
     def __init__(self, dev_handle, ep, buf, iso_packet_count, timeout):
         self._transfer = _lib.libusb_alloc_transfer(iso_packet_count)
         self._ctx = None
         self._buf = buf
+        self._fut = asyncio.Future()
 
     def __del__(self):
         if not self._fut.done():
@@ -717,36 +733,37 @@ class _AsyncTransfer():
     def submit(self, ctx = None):
         """ Submit the USB transfer, but don't wait for completion
 
-        TODO: Is it better to create the Future in __init__ and reuse it?
         TODO 2: Exception when libusb_submit_transfer() fails()
         """
-        self._fut = asyncio.Future()
         self._ctx = ctx
         _check(_lib.libusb_submit_transfer(self._transfer))
 
         return self
 
-    def wait_sync(self):
-        """ Wait synchronously on transfer shich has already been submitted.
-
-        TODO: Is this function needed? If the purpose is to make an async API,
-        then what is the purpose of providing a synchronous function?
-        """
-        asyncio.run(self._usb_event_loop())
-        return self.fut.result()
-
     async def _usb_event_loop(self):
         """ Helper function to process USB events and complete futures
 
         TODO: This processes all events in the current libusb context, self._ctx
-        It seems benign, since transfers that complete earlier will have been
-        marked as donem and not run libusb_handle_events(). However, is this a
-        correct way to handle events?
-        TODO 2: Is libusb_handle_events() really non-blocking?
+
+        TODO 2: provide completed:
+        If the parameter completed is not NULL then after obtaining the event handling lock
+        this function will return immediately if the integer pointed to is not 0.
+        This allows for race free waiting for the completion of a specific transfer.
+
+        TODO 3: provide timeval
+        If a zero timeval is passed, this function will handle any already-pending events
+        and then immediately return in non-blocking style.
+        If a non-zero timeval is passed and no events are currently pending,
+        this function will block waiting for events to handle up until the specified timeout.
+        If an event arrives or a signal is raised, this function will return early.
         """
         while not self._fut.done():
-            _check(_lib.libusb_handle_events(self._ctx))
-            await asyncio.sleep(0.0001)
+            completed = c_int()
+            tv = 0.00001
+            tv_s = int(tv)
+            real_tv = _libusb_timeval(tv_s, int((tv - tv_s) * 1000000))
+            _check(_lib.libusb_handle_events_timeout_completed(self._ctx, byref(real_tv), byref(completed)))
+            await asyncio.sleep(0.001)
 
     async def result(self):
         """ Asynchronous result of USB transfer. Should be 'await'ed
@@ -823,7 +840,8 @@ class _IsoTransferHandler(_objfinalizer.AutoFinalizedObject):
         self.__set_packets_length(length, packet_length)
 
     def _finalize_object(self):
-        _lib.libusb_free_transfer(self.transfer)
+        if hasattr(self, 'transfer'):
+            _lib.libusb_free_transfer(self.transfer)
 
     def submit(self, ctx = None):
         self.__callback_done = 0
@@ -868,9 +886,8 @@ class _LibUSB(usb.backend.IBackend):
 
     @methodtrace(_logger)
     def _finalize_object(self):
-        if self.ctx:
+        if hasattr(self, 'ctx') and self.ctx:
             self.lib.libusb_exit(self.ctx)
-
 
     @methodtrace(_logger)
     def enumerate_devices(self):
@@ -1127,10 +1144,9 @@ class _LibUSB(usb.backend.IBackend):
 def get_backend(find_library=None):
     global _lib, _lib_object
     try:
-        if _lib is None:
+        if _lib_object is None:
             _lib = _load_library(find_library=find_library)
             _setup_prototypes(_lib)
-        if _lib_object is None:
             _lib_object = _LibUSB(_lib)
         return _lib_object
     except usb.libloader.LibraryException:
